@@ -37,7 +37,7 @@ class HerbalDataProcessor:
         text = re.sub(r'<[^>]+>', '', text)
         
         # 移除特殊字符
-        text = re.sub(r'[^\u4e00-\u9fff\w\s,，;；、。！？""''()（）【】\\\[\\\]：:·]', '', text)
+        text = re.sub(r'[^\u4e00-\u9fff\w\s,，;；、。！？""''()（）【】\[\]:：·]', '', text)
         
         return text.strip()
     
@@ -118,11 +118,23 @@ class HerbalDataProcessor:
         
         return dosage
     
-    def generate_common_pairings(self, name: str, category: str) -> List[Dict[str, str]]:
-        """根据药材名称和分类生成常见配伍（示例数据）"""
-        # 这里可以根据实际的中药配伍知识生成
-        # 目前返回模板数据
-        return self.common_pairings_template.copy()
+    def clean_prescriptions(self, prescriptions: List[str]) -> List[str]:
+        """清理和标准化配伍药方"""
+        if not prescriptions or not isinstance(prescriptions, list):
+            return []
+        
+        cleaned = []
+        for prescription in prescriptions:
+            if not prescription or not isinstance(prescription, str):
+                continue
+            
+            # 清理文本
+            prescription = self.clean_text(prescription)
+            
+            if prescription:
+                cleaned.append(prescription)
+        
+        return cleaned
     
     def validate_herbal_data(self, data: Dict[str, Any]) -> bool:
         """验证中药材数据的完整性"""
@@ -185,8 +197,10 @@ class HerbalDataProcessor:
         processed = herbal.copy()
         
         # 清理文本字段
-        text_fields = ['name', 'pinyin', 'category', 'properties', 'taste', 
-                      'dosage', 'usage', 'contraindications', 'description']
+        text_fields = ['name', 'pinyin', 'category', 'taste', 
+                      'contraindications', 'morphology', 'medicinal_part', 
+                      'distribution', 'processing', 'characteristics', 
+                      'pharmacology', 'main_components', 'clinical_application']
         
         for field in text_fields:
             if field in processed:
@@ -196,161 +210,135 @@ class HerbalDataProcessor:
         if 'pinyin' in processed:
             processed['pinyin'] = self.standardize_pinyin(processed['pinyin'])
         
-        # 解析性味
-        if 'properties' in processed and 'taste' in processed:
-            combined_text = f"{processed['properties']} {processed['taste']}"
-            properties, taste = self.parse_properties_and_taste(combined_text)
-            if properties:
-                processed['properties'] = properties
-            if taste:
-                processed['taste'] = taste
-        
         # 标准化归经
         if 'meridians' in processed:
             processed['meridians'] = self.standardize_meridians(processed['meridians'])
         
-        # 标准化列表字段
-        list_fields = ['functions', 'indications']
-        for field in list_fields:
-            if field in processed and isinstance(processed[field], list):
-                processed[field] = [self.clean_text(item) for item in processed[field] if item]
+        # 清理和标准化配伍药方
+        if 'prescriptions' in processed:
+            processed['prescriptions'] = self.clean_prescriptions(processed['prescriptions'])
         
-        # 标准化用法用量
-        if 'dosage' in processed:
-            processed['dosage'] = self.standardize_dosage(processed['dosage'])
-        
-        # 生成常见配伍（如果为空）
-        if 'commonPairings' in processed and not processed['commonPairings']:
-            processed['commonPairings'] = self.generate_common_pairings(
-                processed.get('name', ''), 
-                processed.get('category', '')
-            )
-        
-        # 处理图片字段
+        # 清理图片URL
         if 'images' in processed:
             processed['images'] = self.clean_image_urls(processed['images'])
-        else:
-            processed['images'] = []
         
         return processed
     
     def process_all_data(self, input_file: str, output_file: str) -> None:
-        """处理所有数据"""
+        """处理所有中药材数据并保存"""
         print(f"开始处理数据文件: {input_file}")
-        
-        # 加载数据
         data = self.load_data(input_file)
+        
         if not data:
-            print("没有数据需要处理")
+            print("无数据需要处理")
             return
         
-        print(f"加载了 {len(data)} 条记录")
+        print(f"成功加载 {len(data)} 条中药材记录")
         
         # 处理每条记录
         processed_data = []
-        for i, herbal in enumerate(data, 1):
-            print(f"处理第 {i}/{len(data)} 条记录: {herbal.get('name', '未知')}")
-            
+        for herbal in data:
             if self.validate_herbal_data(herbal):
-                processed = self.process_single_herbal(herbal)
-                processed_data.append(processed)
+                processed_herbal = self.process_single_herbal(herbal)
+                processed_data.append(processed_herbal)
             else:
-                print(f"  跳过无效记录: {herbal}")
-        
-        print(f"处理完成，有效记录 {len(processed_data)} 条")
+                print(f"警告: 跳过无效数据记录 id={herbal.get('id', 'unknown')}, name={herbal.get('name', 'unknown')}")
         
         # 保存处理后的数据
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(processed_data, f, ensure_ascii=False, indent=2)
-            print(f"处理后的数据已保存到: {output_file}")
+            print(f"成功处理并保存 {len(processed_data)} 条中药材记录到 {output_file}")
+            
+            # 生成统计信息
+            stats = self.generate_statistics(processed_data)
+            stats_file = output_file.replace('.json', '_stats.json')
+            with open(stats_file, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+            print(f"统计信息已保存到 {stats_file}")
+            
         except Exception as e:
             print(f"保存数据失败: {e}")
     
     def generate_statistics(self, data: List[Dict[str, Any]]) -> Dict[str, Any]:
         """生成数据统计信息"""
-        if not data:
-            return {}
-        
         stats = {
-            'total_count': len(data),
-            'categories': {},
-            'meridians': {},
-            'properties': {},
-            'taste': {},
-            'completeness': {
-                'has_pinyin': 0,
-                'has_category': 0,
-                'has_functions': 0,
-                'has_indications': 0,
-                'has_dosage': 0,
-                'has_commonPairings': 0,
-                'has_images': 0
-            }
+            "total_count": len(data),
+            "categories": {},
+            "meridians": {},
+            "image_coverage": 0,
+            "fields_coverage": {}
         }
         
-        for herbal in data:
+        # 字段覆盖率统计
+        fields = ['name', 'pinyin', 'category', 'taste', 'meridians', 
+                 'morphology', 'medicinal_part', 'distribution', 'processing', 
+                 'characteristics', 'pharmacology', 'main_components', 
+                 'clinical_application', 'prescriptions', 'contraindications', 'images']
+        
+        field_counts = {field: 0 for field in fields}
+        
+        for herb in data:
             # 统计分类
-            category = herbal.get('category', '未分类')
-            stats['categories'][category] = stats['categories'].get(category, 0) + 1
+            category = herb.get('category', '')
+            if category:
+                if category in stats['categories']:
+                    stats['categories'][category] += 1
+                else:
+                    stats['categories'][category] = 1
             
             # 统计归经
-            meridians = herbal.get('meridians', [])
-            for meridian in meridians:
-                stats['meridians'][meridian] = stats['meridians'].get(meridian, 0) + 1
+            for meridian in herb.get('meridians', []):
+                if meridian in stats['meridians']:
+                    stats['meridians'][meridian] += 1
+                else:
+                    stats['meridians'][meridian] = 1
             
-            # 统计性质
-            properties = herbal.get('properties', '')
-            if properties:
-                stats['properties'][properties] = stats['properties'].get(properties, 0) + 1
+            # 统计图片覆盖
+            if herb.get('images', []):
+                stats['image_coverage'] += 1
             
-            # 统计味道
-            taste = herbal.get('taste', '')
-            if taste:
-                stats['taste'][taste] = stats['taste'].get(taste, 0) + 1
-            
-            # 统计完整性
-            if herbal.get('pinyin'):
-                stats['completeness']['has_pinyin'] += 1
-            if herbal.get('category'):
-                stats['completeness']['has_category'] += 1
-            if herbal.get('functions'):
-                stats['completeness']['has_functions'] += 1
-            if herbal.get('indications'):
-                stats['completeness']['has_indications'] += 1
-            if herbal.get('dosage'):
-                stats['completeness']['has_dosage'] += 1
-            if herbal.get('commonPairings'):
-                stats['completeness']['has_commonPairings'] += 1
-            if herbal.get('images'):
-                stats['completeness']['has_images'] += 1
+            # 统计字段覆盖
+            for field in fields:
+                if field in herb:
+                    value = herb[field]
+                    if isinstance(value, list) and value:
+                        field_counts[field] += 1
+                    elif isinstance(value, str) and value:
+                        field_counts[field] += 1
+                    elif value:  # 其他非空值
+                        field_counts[field] += 1
+        
+        # 计算覆盖率
+        for field, count in field_counts.items():
+            stats['fields_coverage'][field] = {
+                'count': count,
+                'percentage': round(count / len(data) * 100, 2) if data else 0
+            }
+        
+        # 图片覆盖率
+        stats['image_coverage'] = {
+            'count': stats['image_coverage'],
+            'percentage': round(stats['image_coverage'] / len(data) * 100, 2) if data else 0
+        }
         
         return stats
 
 def main():
     """主函数"""
+    print("=== 中药材数据处理工具 ===")
+    
     processor = HerbalDataProcessor()
     
-    # 处理爬取的数据
-    input_file = 'herbal_medicine_data.json'
-    output_file = 'herbal_medicine_data_processed.json'
+    input_file = input("请输入要处理的数据文件路径 (默认: zhongyoo_herbal_data.json): ").strip()
+    if not input_file:
+        input_file = "zhongyoo_herbal_data.json"
+    
+    output_file = input("请输入处理后的输出文件路径 (默认: processed_herbal_data.json): ").strip()
+    if not output_file:
+        output_file = "processed_herbal_data.json"
     
     processor.process_all_data(input_file, output_file)
-    
-    # 生成统计信息
-    processed_data = processor.load_data(output_file)
-    if processed_data:
-        stats = processor.generate_statistics(processed_data)
-        
-        # 保存统计信息
-        with open('data_statistics.json', 'w', encoding='utf-8') as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
-        
-        print("\n=== 数据统计 ===")
-        print(f"总记录数: {stats['total_count']}")
-        print(f"分类统计: {len(stats['categories'])} 个分类")
-        print(f"归经统计: {len(stats['meridians'])} 个归经")
-        print(f"数据完整性统计已保存到 data_statistics.json")
 
 if __name__ == "__main__":
     main() 

@@ -46,7 +46,7 @@ def test_crawler():
     print("选择测试类型:")
     print("1. 快速功能测试")
     print("2. 完整功能测试")
-    print("3. 查看所有分类")
+    print("3. 查看药材列表页")
     
     choice = input("请选择测试类型 (1-3): ").strip()
     
@@ -57,12 +57,12 @@ def test_crawler():
         print("🔍 运行完整测试...")
         os.system("py test_zhongyoo_crawler.py")
     elif choice == "3":
-        print("📋 查看分类列表...")
+        print("📋 查看药材列表页...")
         crawler = ZhongYooHerbalCrawler()
-        categories = crawler.parse_category_page()
-        print(f"\n找到 {len(categories)} 个分类:")
-        for i, category in enumerate(categories, 1):
-            print(f"{i}. {category['name']} - {category['url']}")
+        herbs, total_pages = crawler.parse_name_list_page(1)
+        print(f"\n找到 {total_pages} 个页面，第1页有 {len(herbs)} 个药材:")
+        for i, herb in enumerate(herbs[:10], 1):  # 只显示前10个
+            print(f"{i}. {herb['name']} - {herb['url']}")
     else:
         print("❌ 无效选择")
 
@@ -71,8 +71,8 @@ def run_zhongyoo_crawler():
     crawler = ZhongYooHerbalCrawler()
     
     print("🎯 中医药网数据爬取选项:")
-    print("1. 小规模测试 (1个分类，3个药材)")
-    print("2. 中等规模爬取 (3个分类，每个5个药材)")
+    print("1. 小规模测试 (1页，3个药材)")
+    print("2. 中等规模爬取 (3页，每页5个药材)")
     print("3. 自定义爬取数量")
     print("4. 爬取所有数据 ⚠️")
     
@@ -82,7 +82,7 @@ def run_zhongyoo_crawler():
         # 小规模测试
         print("🧪 开始小规模测试爬取...")
         try:
-            crawler.crawl_all_categories(max_categories=1, max_herbs_per_category=3)
+            crawler.crawl_all_pages(max_pages=1, max_herbs_per_page=3)
             print("✅ 小规模测试完成！")
         except KeyboardInterrupt:
             print("⏹️ 用户中断爬取")
@@ -95,7 +95,7 @@ def run_zhongyoo_crawler():
         # 中等规模爬取
         print("🚀 开始中等规模爬取...")
         try:
-            crawler.crawl_all_categories(max_categories=3, max_herbs_per_category=5)
+            crawler.crawl_all_pages(max_pages=3, max_herbs_per_page=5)
             print("✅ 中等规模爬取完成！")
         except KeyboardInterrupt:
             print("⏹️ 用户中断爬取")
@@ -106,19 +106,19 @@ def run_zhongyoo_crawler():
     
     elif sub_choice == "3":
         # 自定义爬取
-        max_categories = input("请输入要爬取的分类数量（默认3个）: ").strip()
-        max_herbs = input("请输入每个分类爬取的药材数量（默认5个）: ").strip()
+        max_pages = input("请输入要爬取的页面数量（默认3页）: ").strip()
+        max_herbs = input("请输入每个页面爬取的药材数量（默认5个）: ").strip()
         
         try:
-            max_categories = int(max_categories) if max_categories else 3
+            max_pages = int(max_pages) if max_pages else 3
             max_herbs = int(max_herbs) if max_herbs else 5
         except ValueError:
-            max_categories, max_herbs = 3, 5
+            max_pages, max_herbs = 3, 5
         
-        print(f"🎯 开始自定义爬取 ({max_categories}个分类，每个{max_herbs}个药材)...")
+        print(f"🎯 开始自定义爬取 ({max_pages}页，每页{max_herbs}个药材)...")
         try:
-            crawler.crawl_all_categories(max_categories=max_categories, 
-                                       max_herbs_per_category=max_herbs)
+            crawler.crawl_all_pages(max_pages=max_pages, 
+                                   max_herbs_per_page=max_herbs)
             print("✅ 自定义爬取完成！")
         except KeyboardInterrupt:
             print("⏹️ 用户中断爬取")
@@ -129,11 +129,11 @@ def run_zhongyoo_crawler():
     
     elif sub_choice == "4":
         # 爬取所有数据
-        confirm = input("⚠️  这将爬取所有分类的所有药材数据，可能需要很长时间。确认继续？(y/N): ").strip().lower()
+        confirm = input("⚠️  这将爬取所有页面的所有药材数据（约45页，899个药材），可能需要很长时间。确认继续？(y/N): ").strip().lower()
         if confirm == 'y':
             print("🌍 开始完整数据爬取...")
             try:
-                crawler.crawl_all_categories()
+                crawler.crawl_all_pages()
                 print("✅ 完整数据爬取完成！")
             except KeyboardInterrupt:
                 print("⏹️ 用户中断爬取")
@@ -173,14 +173,14 @@ def run_complete_workflow():
     print("🔄 完整流程将进行数据爬取和处理")
     
     # 设置爬取参数
-    max_categories = input("请输入要爬取的分类数量（默认3个）: ").strip()
-    max_herbs = input("请输入每个分类爬取的药材数量（默认5个）: ").strip()
+    max_pages = input("请输入要爬取的页面数量（默认3页）: ").strip()
+    max_herbs = input("请输入每个页面爬取的药材数量（默认5个）: ").strip()
     
     try:
-        max_categories = int(max_categories) if max_categories else 3
+        max_pages = int(max_pages) if max_pages else 3
         max_herbs = int(max_herbs) if max_herbs else 5
     except ValueError:
-        max_categories, max_herbs = 3, 5
+        max_pages, max_herbs = 3, 5
         
     # 1. 爬取数据
     print("\n🚀 步骤1: 爬取数据...")
@@ -188,8 +188,8 @@ def run_complete_workflow():
     input_file = 'zhongyoo_herbal_data.json'
     
     try:
-        crawler.crawl_all_categories(max_categories=max_categories, 
-                                   max_herbs_per_category=max_herbs)
+        crawler.crawl_all_pages(max_pages=max_pages, 
+                               max_herbs_per_page=max_herbs)
     except KeyboardInterrupt:
         print("⏹️ 用户中断爬取")
         crawler.save_data()

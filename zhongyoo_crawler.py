@@ -5,9 +5,8 @@
 作者: AI Assistant
 功能: 爬取中医药网(zhongyoo.com)的中药材数据
 网站结构:
-1. 功效分类页面: http://www.zhongyoo.com/gx/
-2. 分类药材列表: http://www.zhongyoo.com/gx/{category}/
-3. 药材详情页面: http://www.zhongyoo.com/name/{name}_{id}.html
+1. 名称列表页面: http://www.zhongyoo.com/name/
+2. 药材详情页面: http://www.zhongyoo.com/name/{name}_{id}.html
 """
 
 import requests
@@ -15,12 +14,15 @@ from bs4 import BeautifulSoup
 import json
 import time
 import re
+import sys
+import random
 from fake_useragent import UserAgent
 from retrying import retry
 import os
 from urllib.parse import urljoin, urlparse
 import logging
 import chardet
+import argparse
 
 # 配置日志
 logging.basicConfig(
@@ -35,7 +37,7 @@ logging.basicConfig(
 class ZhongYooHerbalCrawler:
     def __init__(self):
         self.base_url = "http://www.zhongyoo.com"
-        self.category_url = "http://www.zhongyoo.com/gx/"
+        self.name_list_url = "http://www.zhongyoo.com/name/"
         self.session = requests.Session()
         self.ua = UserAgent()
         self.session.headers.update({
@@ -48,40 +50,46 @@ class ZhongYooHerbalCrawler:
         })
         self.herbal_data = []
         self.current_id = 1
-        self.categories = []
+        # 爬取间隔设置
+        self.page_interval = (4, 6)  # 页面间隔4-6秒
+        self.item_interval = (2, 3)  # 药材项目间隔2-3秒
         
     @retry(stop_max_attempt_number=3, wait_random_min=1000, wait_random_max=3000)
     def get_page(self, url):
         """获取页面内容，包含重试机制和编码检测"""
         try:
+            # 每次请求前更新User-Agent
+            self.session.headers.update({
+                'User-Agent': self.ua.random,
+            })
+            
             response = self.session.get(url, timeout=15)
             response.raise_for_status()
             
-            # 直接从bytes解码，按优先级尝试编码
-            content_bytes = response.content
+            # 尝试不同编码
+            encodings = ['gb2312', 'gbk', 'gb18030', 'utf-8']
+            content = None
             
-            # 网站检测到使用GBK/GB2312编码，优先尝试
-            encodings_to_try = ['gbk', 'gb2312', 'gb18030', 'utf-8']
-            
-            for encoding in encodings_to_try:
+            for encoding in encodings:
                 try:
-                    decoded_text = content_bytes.decode(encoding)
-                    # 检查是否包含有效的中文字符
-                    if self._is_valid_chinese_text(decoded_text):
-                        return decoded_text
+                    content = response.content.decode(encoding)
+                    break
                 except UnicodeDecodeError:
                     continue
             
-            # 如果都失败了，使用chardet检测
-            detected_encoding = chardet.detect(content_bytes)
-            if detected_encoding['encoding'] and detected_encoding['confidence'] > 0.5:
-                try:
-                    return content_bytes.decode(detected_encoding['encoding'])
-                except:
-                    pass
+            if content is None:
+                # 如果所有编码都失败，使用chardet检测
+                detected_encoding = chardet.detect(response.content)
+                if detected_encoding['encoding']:
+                    try:
+                        content = response.content.decode(detected_encoding['encoding'])
+                    except UnicodeDecodeError:
+                        # 如果依然失败，使用忽略错误的方式解码
+                        content = response.content.decode('gb2312', errors='ignore')
+                else:
+                    content = response.content.decode('gb2312', errors='ignore')
             
-            # 最后的兜底方案
-            return content_bytes.decode('gbk', errors='ignore')
+            return content
             
         except Exception as e:
             logging.error(f"获取页面失败: {url}, 错误: {e}")
@@ -99,89 +107,41 @@ class ZhongYooHerbalCrawler:
         
         return has_chinese and not has_garbled
     
-    def parse_category_page(self):
-        """解析功效分类页面，获取所有药材分类"""
-        logging.info(f"正在爬取分类页面: {self.category_url}")
+    def parse_name_list_page(self, page_num=1):
+        """解析药材名称列表页面"""
+        url = f"{self.name_list_url}page_{page_num}.html" if page_num > 1 else self.name_list_url
+        logging.info(f"正在爬取名称列表页面: {url}")
         
         try:
-            html = self.get_page(self.category_url)
-            soup = BeautifulSoup(html, 'lxml')
-            
-            categories = []
-            
-            # 查找所有分类链接
-            # 根据网站结构，寻找指向分类页面的链接
-            category_links = soup.find_all('a', href=re.compile(r'/gx/[^/]+/$'))
-            
-            for link in category_links:
-                category_name = link.get_text(strip=True)
-                category_url = urljoin(self.base_url, link.get('href'))
-                
-                if category_name and category_name not in ['首页', '更多']:
-                    categories.append({
-                        'name': category_name,
-                        'url': category_url
-                    })
-            
-            # 如果没有找到链接，尝试其他选择器
-            if not categories:
-                # 尝试查找包含分类信息的其他元素
-                potential_links = soup.find_all('a')
-                for link in potential_links:
-                    href = link.get('href', '')
-                    text = link.get_text(strip=True)
-                    if '/gx/' in href and href.endswith('/') and len(text) > 1 and len(text) < 10:
-                        category_url = urljoin(self.base_url, href)
-                        if category_url not in [cat['url'] for cat in categories]:
-                            categories.append({
-                                'name': text,
-                                'url': category_url
-                            })
-            
-            self.categories = categories
-            logging.info(f"找到 {len(categories)} 个药材分类")
-            
-            for category in categories[:5]:  # 显示前5个分类作为示例
-                logging.info(f"分类: {category['name']} - {category['url']}")
-            
-            return categories
-            
-        except Exception as e:
-            logging.error(f"解析分类页面失败: {e}")
-            return []
-    
-    def parse_category_list_page(self, category):
-        """解析某个分类下的药材列表页面"""
-        category_name = category['name']
-        category_url = category['url']
-        
-        logging.info(f"正在爬取分类 '{category_name}' 的药材列表: {category_url}")
-        
-        try:
-            html = self.get_page(category_url)
+            html = self.get_page(url)
             soup = BeautifulSoup(html, 'lxml')
             
             herbal_items = []
             
-            # 查找药材链接
-            # 根据网站结构，寻找指向药材详情页面的链接
-            herbal_links = soup.find_all('a', href=re.compile(r'/name/[^/]+\.html'))
+            # 查找药材列表区域 - 根据网页结构，查找包含药材信息的 div.r2-con
+            r2_con_div = soup.find('div', class_='r2-con')
             
-            for link in herbal_links:
-                herb_name = link.get_text(strip=True)
-                herb_url = urljoin(self.base_url, link.get('href'))
+            if r2_con_div:
+                # 找到所有药材项目 div.sp
+                herb_divs = r2_con_div.find_all('div', class_='sp')
                 
-                if herb_name and len(herb_name) > 0:
-                    herbal_items.append({
-                        'name': herb_name,
-                        'url': herb_url,
-                        'category': category_name
-                    })
+                for herb_div in herb_divs:
+                    # 获取药材名称和链接
+                    link_tag = herb_div.find('a', class_='title')
+                    if link_tag:
+                        herb_name = link_tag.get_text(strip=True)
+                        herb_url = urljoin(self.base_url, link_tag.get('href'))
+                        
+                        if herb_name and len(herb_name) > 0 and herb_url:
+                            herbal_items.append({
+                                'name': herb_name,
+                                'url': herb_url
+                            })
             
-            # 如果没有找到，尝试其他方式
+            # 如果没有找到药材项目，尝试其他方式
             if not herbal_items:
-                # 查找所有可能的链接
-                all_links = soup.find_all('a')
+                # 查找所有可能的药材链接
+                all_links = soup.find_all('a', class_='title')
                 for link in all_links:
                     href = link.get('href', '')
                     text = link.get_text(strip=True)
@@ -189,22 +149,43 @@ class ZhongYooHerbalCrawler:
                         herb_url = urljoin(self.base_url, href)
                         herbal_items.append({
                             'name': text,
-                            'url': herb_url,
-                            'category': category_name
+                            'url': herb_url
                         })
             
-            logging.info(f"在分类 '{category_name}' 中找到 {len(herbal_items)} 个药材")
-            return herbal_items
+            logging.info(f"在页面 {page_num} 中找到 {len(herbal_items)} 个药材")
+            
+            # 获取最大页码数
+            max_page = 1
+            pagination_div = soup.find('div', class_='dede_pages')
+            if pagination_div:
+                # 查找最后一页链接
+                last_page_link = pagination_div.find('a', string='末页')
+                if last_page_link:
+                    href = last_page_link.get('href', '')
+                    match = re.search(r'page_(\d+)\.html', href)
+                    if match:
+                        max_page = int(match.group(1))
+                
+                # 如果没有找到末页链接，则查找所有页码链接
+                if max_page == 1:
+                    page_links = pagination_div.find_all('a', href=re.compile(r'page_\d+\.html'))
+                    for page_link in page_links:
+                        match = re.search(r'page_(\d+)\.html', page_link.get('href', ''))
+                        if match:
+                            page_num = int(match.group(1))
+                            if page_num > max_page:
+                                max_page = page_num
+            
+            return herbal_items, max_page
             
         except Exception as e:
-            logging.error(f"解析分类 '{category_name}' 列表页面失败: {e}")
-            return []
+            logging.error(f"解析名称列表页面失败: {e}")
+            return [], 1
     
     def parse_herb_detail_page(self, herb_item):
         """解析药材详情页面"""
         name = herb_item['name']
         url = herb_item['url']
-        category = herb_item.get('category', '')
         
         logging.info(f"正在爬取药材 '{name}' 的详细信息: {url}")
         
@@ -217,29 +198,128 @@ class ZhongYooHerbalCrawler:
                 "id": self.current_id,
                 "name": name,
                 "pinyin": "",
-                "category": category,
-                "properties": "",
+                "category": "",
                 "taste": "",
                 "meridians": [],
-                "functions": [],
-                "indications": [],
-                "dosage": "",
-                "commonPairings": [],
-                "contraindications": "",
-                "description": "",
+                "morphology": "",  # 植物形态
+                "medicinal_part": "",  # 药用部位
+                "distribution": "",  # 产地分布
+                "processing": "",  # 采收加工
+                "characteristics": "",  # 药材性状
+                "pharmacology": "",  # 药理研究
+                "main_components": "",  # 主要成分/化学成分
+                "clinical_application": "",  # 临床应用
+                "prescriptions": [],  # 配伍药方
+                "contraindications": "",  # 使用禁忌
                 "images": [],
                 "source_url": url
             }
             
-            # 获取页面文本用于解析
-            page_text = soup.get_text()
+            # 查找内容区域
+            # 首先尝试class='wrap1'包含的内容
+            content_div = None
             
-            # 提取各种信息
-            self.extract_basic_info(herbal_data, page_text, soup)
-            self.extract_effects_info(herbal_data, page_text, soup)
-            self.extract_usage_info(herbal_data, page_text, soup)
-            self.extract_cautions_info(herbal_data, page_text, soup)
-            self.extract_description(herbal_data, page_text, soup)
+            # 查找各种可能的内容区域
+            content_candidates = [
+                soup.find('div', class_='text'),
+                soup.find('div', class_='gaishu'),
+                soup.find('div', class_='con_left2'),
+                soup.find('div', class_='wrap1')
+            ]
+            
+            # 选择第一个找到的且包含足够文本的区域
+            for div in content_candidates:
+                if div and len(div.get_text(strip=True)) > 100:
+                    content_div = div
+                    break
+            
+            # 如果没有找到合适的区域，尝试找最长文本的div
+            if not content_div:
+                all_divs = soup.find_all('div')
+                max_text_len = 0
+                for div in all_divs:
+                    text_len = len(div.get_text(strip=True))
+                    if text_len > max_text_len:
+                        max_text_len = text_len
+                        content_div = div
+            
+            if not content_div:
+                logging.warning(f"在页面中未找到主要内容区域: {url}")
+                return None
+                
+            html_content = str(content_div)
+            
+            # 首先查找所有【<strong>...</strong>】格式的标题
+            section_titles = re.findall(r'【<strong>(.*?)</strong>】', html_content)
+            
+            # 遍历找到的标题进行内容提取
+            for title in section_titles:
+                pattern = f'【<strong>{title}</strong>】(.*?)(?:【<strong>|<div class="pagead">|$)'
+                match = re.search(pattern, html_content, re.DOTALL)
+                if match:
+                    content = match.group(1).strip()
+                    clean_content = self._clean_html_tags(content)
+                    
+                    # 根据标题填充对应字段
+                    if title == "中药名":
+                        # 从内容中提取拼音部分，通常在中药名后面
+                        name_parts = clean_content.split()
+                        if len(name_parts) > 1:
+                            herbal_data["pinyin"] = name_parts[1]
+                    elif title == "性味归经":
+                        herbal_data["taste"] = clean_content
+                        # 从性味归经中提取归经信息
+                        meridians = re.findall(r'[肝心脾肺肾胃大小肠三焦膀胱胆]经', clean_content)
+                        if meridians:
+                            herbal_data["meridians"] = list(set(meridians))
+                    elif title == "植物形态":
+                        herbal_data["morphology"] = clean_content
+                    elif title == "药用部位":
+                        herbal_data["medicinal_part"] = clean_content
+                    elif title == "产地分布":
+                        herbal_data["distribution"] = clean_content
+                    elif title == "采收加工":
+                        herbal_data["processing"] = clean_content
+                    elif title == "药材性状":
+                        herbal_data["characteristics"] = clean_content
+                    elif title == "功效与作用":
+                        # 从功效与作用中可能可以提取分类信息
+                        herbal_data["category"] = self._extract_category(clean_content)
+                    elif title == "药理研究":
+                        herbal_data["pharmacology"] = clean_content
+                    elif title == "化学成分" or title == "主要成分":
+                        herbal_data["main_components"] = clean_content
+                    elif title == "临床应用":
+                        herbal_data["clinical_application"] = clean_content
+                    elif title == "配伍药方":
+                        # 提取药方条目，尝试各种可能的格式
+                        prescriptions = []
+                        
+                        # 尝试使用序号提取方剂
+                        # 中文数字序号
+                        chinese_numbered = re.findall(r'[①②③④⑤⑥⑦⑧⑨⑩].*?(?=(?:[①②③④⑤⑥⑦⑧⑨⑩]|$))', clean_content)
+                        if chinese_numbered:
+                            prescriptions.extend(chinese_numbered)
+                        
+                        # 阿拉伯数字序号
+                        if not prescriptions:
+                            arabic_numbered = re.findall(r'[1-9]、.*?(?=(?:[1-9]、|$))', clean_content)
+                            if arabic_numbered:
+                                prescriptions.extend(arabic_numbered)
+                        
+                        # 书名号《》包裹的方剂
+                        if not prescriptions:
+                            book_titled = re.findall(r'《.*?》.*?(?=(?:《|$))', clean_content)
+                            if book_titled:
+                                prescriptions.extend(book_titled)
+                        
+                        # 如果以上都未提取到，可能是单方或其他格式，直接使用整个内容
+                        if not prescriptions and clean_content:
+                            prescriptions = [clean_content]
+                        
+                        herbal_data["prescriptions"] = [p.strip() for p in prescriptions if p.strip()]
+                    elif title == "使用禁忌" or title == "禁忌":
+                        herbal_data["contraindications"] = clean_content
             
             # 提取图片
             herbal_data['images'] = self.extract_images(soup, url)
@@ -247,7 +327,7 @@ class ZhongYooHerbalCrawler:
             self.current_id += 1
             
             # 延时避免请求过快
-            time.sleep(1)
+            time.sleep(random.uniform(self.item_interval[0], self.item_interval[1]))
             
             return herbal_data
             
@@ -255,738 +335,356 @@ class ZhongYooHerbalCrawler:
             logging.error(f"解析药材 '{name}' 详情页面失败: {e}")
             return None
     
-    def extract_basic_info(self, herbal_data, page_text, soup):
-        """提取基本信息：拼音、性味、归经等"""
-        try:
-            # 清理文本，去除多余空白
-            cleaned_text = re.sub(r'\s+', ' ', page_text)
-            
-            # 提取拼音
-            pinyin_patterns = [
-                r'【中药名】.*?\s+([a-z\s]+)',
-                r'拼音[：:\s]*([a-z\s]+)',
-                r'【拼音】[：:\s]*([a-z\s]+)',
-            ]
-            
-            for pattern in pinyin_patterns:
-                match = re.search(pattern, cleaned_text, re.IGNORECASE)
-                if match:
-                    pinyin = match.group(1).strip()
-                    if len(pinyin) < 50 and re.match(r'^[a-z\s]+$', pinyin, re.IGNORECASE):
-                        herbal_data['pinyin'] = pinyin
-                        break
-            
-            # 提取性味归经（完整字段用于后续分析）
-            taste_meridian_patterns = [
-                r'【性味归经】([^【]+)',
-                r'性味归经[：:\s]*([^【]+)',
-            ]
-            
-            taste_meridian_text = ""
-            for pattern in taste_meridian_patterns:
-                match = re.search(pattern, cleaned_text)
-                if match:
-                    taste_meridian_text = match.group(1).strip()
-                    if len(taste_meridian_text) < 200:
-                        break
-            
-            # 分离提取性味和归经
-            self.extract_taste_and_meridians(herbal_data, taste_meridian_text, cleaned_text)
-                    
-        except Exception as e:
-            logging.warning(f"提取基本信息失败: {e}")
-
-    def extract_taste_and_meridians(self, herbal_data, taste_meridian_text, cleaned_text):
-        """分离提取性味和归经信息"""
-        try:
-            # 首先尝试从性味归经字段中提取完整的性味信息
-            if taste_meridian_text:
-                # 提取完整的性味描述
-                taste_match = re.search(r'([味性][甘苦辛咸酸涩寒热温凉平微]+[，、\s]*[性味][甘苦辛咸酸涩寒热温凉平微]*|味[甘苦辛咸酸涩]+[，、\s]*性[寒热温凉平微]+|性[寒热温凉平微]+[，、\s]*味[甘苦辛咸酸涩]+)', taste_meridian_text)
-                
-                if taste_match:
-                    herbal_data['taste'] = taste_match.group(1).strip()
-                else:
-                    # 如果没有匹配到完整格式，尝试单独匹配
-                    taste_parts = []
-                    wei_match = re.search(r'味([甘苦辛咸酸涩]+)', taste_meridian_text)
-                    if wei_match:
-                        taste_parts.append(f"味{wei_match.group(1)}")
-                    
-                    xing_match = re.search(r'性([寒热温凉平微]+)', taste_meridian_text)
-                    if xing_match:
-                        taste_parts.append(f"性{xing_match.group(1)}")
-                    
-                    if taste_parts:
-                        herbal_data['taste'] = "，".join(taste_parts)
-                
-                # 从性味归经字段中提取归经
-                meridians = re.findall(r'[肺心肝脾肾胃肠膀胱胆]经', taste_meridian_text)
-                if meridians:
-                    herbal_data['meridians'] = list(set(meridians))
-            
-            # 如果性味归经字段没有提供完整信息，尝试其他位置
-            if not herbal_data['taste']:
-                # 单独查找性味
-                taste_only_patterns = [
-                    r'【性味】([^【]+)',
-                    r'性味[：:\s]*([^【]+)',
-                ]
-                
-                for pattern in taste_only_patterns:
-                    match = re.search(pattern, cleaned_text)
-                    if match:
-                        taste_text = match.group(1).strip()
-                        if len(taste_text) < 100:
-                            herbal_data['taste'] = taste_text
-                            break
-            
-            if not herbal_data['meridians']:
-                # 单独查找归经
-                meridian_patterns = [
-                    r'【归经】([^【]+)',
-                    r'归经[：:\s]*([^【]+)',
-                    r'归([肺心肝脾肾胃肠膀胱胆经、，\s]+)',
-                    r'入([肺心肝脾肾胃肠膀胱胆经、，\s]+)',
-                ]
-                
-                for pattern in meridian_patterns:
-                    match = re.search(pattern, cleaned_text)
-                    if match:
-                        meridians_text = match.group(1)
-                        meridians = re.findall(r'[肺心肝脾肾胃肠膀胱胆]经', meridians_text)
-                        if meridians:
-                            herbal_data['meridians'] = list(set(meridians))
-                            break
-                    
-        except Exception as e:
-            logging.warning(f"分离性味归经失败: {e}")
-
-    def extract_effects_info(self, herbal_data, page_text, soup):
-        """提取功效和主治信息"""
-        try:
-            cleaned_text = re.sub(r'\s+', ' ', page_text)
-            
-            # 提取功效与作用
-            function_patterns = [
-                r'【功效与作用】([^【]+)',
-                r'功效与作用[：:\s]*([^【]+)',
-                r'功效[：:\s]*([^【]+)',
-            ]
-            
-            for pattern in function_patterns:
-                match = re.search(pattern, cleaned_text)
-                if match:
-                    functions_text = match.group(1).strip()
-                    if len(functions_text) < 300:  # 避免获取过长文本
-                        # 清理无关的分类描述
-                        functions_text = self.clean_functions_text(functions_text)
-                        # 分割功效
-                        functions = re.split(r'[，、；;]', functions_text)
-                        # 清理每个功效项，去除末尾的句号和空白字符
-                        herbal_data['functions'] = [f.strip().rstrip('。') for f in functions if f.strip() and len(f.strip()) < 50 and not self.is_classification_text(f.strip())]
-                        break
-            
-            # 提取主治（排除用量信息）
-            indication_patterns = [
-                r'【主治】([^【]+)',
-                r'主治[：:\s]*([^【]+)',
-                r'【临床应用】([^【]+)',
-            ]
-            
-            for pattern in indication_patterns:
-                match = re.search(pattern, cleaned_text)
-                if match:
-                    indications_text = match.group(1).strip()
-                    if len(indications_text) < 300:
-                        # 提取用量信息到dosage字段
-                        dosage_info = self.extract_dosage_from_indications(indications_text)
-                        if dosage_info and not herbal_data['dosage']:
-                            herbal_data['dosage'] = dosage_info
-                        
-                        # 清理主治信息，移除用量相关内容
-                        clean_indications_text = self.clean_indications_text(indications_text)
-                        
-                        # 分割主治
-                        indications = re.split(r'[，、；;]', clean_indications_text)
-                        # 清理每个主治项，去除末尾的句号和空白字符
-                        herbal_data['indications'] = [i.strip().rstrip('。') for i in indications if i.strip() and len(i.strip()) < 50 and not self.is_dosage_text(i.strip())]
-                        break
-            
-            # 提取更细化的分类信息
-            self.extract_detailed_category(herbal_data, cleaned_text)
-            
-            # 提取配伍药方信息
-            self.extract_common_pairings(herbal_data, cleaned_text)
-                    
-        except Exception as e:
-            logging.warning(f"提取功效信息失败: {e}")
-
-    def clean_functions_text(self, text):
-        """清理功效文本中的无关信息"""
-        # 移除分类描述
-        patterns_to_remove = [
-            r'属.*?药下属分类的.*?药[。，、\s]*',
-            r'属.*?药[。，、\s]*',
-            r'下属分类的.*?药[。，、\s]*',
+    def _extract_category(self, text):
+        """从功效与作用中提取分类信息"""
+        category = ""
+        # 常见分类关键词
+        category_patterns = [
+            r'属(.*?)药',
+            r'属于(.*?)类',
+            r'归属(.*?)类'
         ]
         
-        cleaned_text = text
-        for pattern in patterns_to_remove:
-            cleaned_text = re.sub(pattern, '', cleaned_text)
-        
-        return cleaned_text.strip()
-
-    def is_classification_text(self, text):
-        """判断是否为分类描述文本"""
-        classification_keywords = ['属', '下属分类', '分类']
-        return any(keyword in text for keyword in classification_keywords)
-
-    def extract_dosage_from_indications(self, text):
-        """从主治文本中提取用量信息"""
-        dosage_patterns = [
-            r'用量(\d+[-~～]\d+[克g])[，、\s]*([^。]+)',
-            r'用量[：:\s]*([^。]{1,100})',
-            r'(\d+[-~～]\d+[克g])[，、\s]*煎服',
-            r'煎服[^。]*?(\d+[-~～]\d+[克g])',
-        ]
-        
-        for pattern in dosage_patterns:
+        for pattern in category_patterns:
             match = re.search(pattern, text)
             if match:
-                return match.group(0).strip()
+                category = match.group(1).strip()
+                break
         
-        return ""
-
-    def clean_indications_text(self, text):
-        """清理主治文本，移除用量相关信息"""
-        # 移除用量相关的句子
-        patterns_to_remove = [
-            r'用量\d+[-~～]\d+[克g][^。]*',
-            r'[，、\s]*煎服[^。]*',
-            r'[，、\s]*外用适量[^。]*',
-            r'[，、\s]*研末调敷[^。]*',
-            r'[，、\s]*煎水浸渍患处[^。]*',
-            r'用治[：\s]*',
-            r'^[。，、\s]+',  # 移除开头的标点符号
-        ]
-        
-        cleaned_text = text
-        for pattern in patterns_to_remove:
-            cleaned_text = re.sub(pattern, '', cleaned_text)
-        
-        return cleaned_text.strip()
-
-    def is_dosage_text(self, text):
-        """判断是否为用量相关文本"""
-        dosage_keywords = ['用量', '煎服', '外用', '研末', '浸渍']
-        return any(keyword in text for keyword in dosage_keywords)
-
-    def extract_detailed_category(self, herbal_data, cleaned_text):
-        """提取更详细的分类信息"""
-        try:
-            # 查找更具体的分类描述
-            detailed_category_patterns = [
-                r'属([^。]*?)药下属分类的([^。]*?药)',
-                r'属([^。]*?药)下属分类的([^。]*?药)',
-                r'([清热泻火解毒凉血燥湿温里理气活血化瘀止血补气血阴阳安神开窍祛风湿化痰止咳平喘消食驱虫外用]+药)',
-            ]
-            
-            for pattern in detailed_category_patterns:
-                match = re.search(pattern, cleaned_text)
-                if match:
-                    if len(match.groups()) >= 2:
-                        # 如果有两个分组，取更具体的分类
-                        detailed_category = match.group(2).strip()
-                        if detailed_category and len(detailed_category) < 20:
-                            herbal_data['category'] = detailed_category
-                            break
-                    else:
-                        # 只有一个分组
-                        detailed_category = match.group(1).strip()
-                        if detailed_category and len(detailed_category) < 20:
-                            herbal_data['category'] = detailed_category
-                            break
-        except Exception as e:
-            logging.warning(f"提取详细分类失败: {e}")
-
-    def extract_usage_info(self, herbal_data, page_text, soup):
-        """提取用法用量信息 - 优化版：提取完整的临床应用内容"""
-        try:
-            cleaned_text = re.sub(r'\s+', ' ', page_text)
-            
-            # 尝试提取完整的临床应用信息（无论dosage是否已有内容）
-            dosage_patterns = [
-                # 模式3效果最好：匹配临床应用到下一个【】标记
-                r'临床应用[：:\s]*([^【]*?)(?=【|$)',
-                # 备用模式：匹配【临床应用】到下一个【】标记之间的内容
-                r'【临床应用】([^【]+?)(?=【|$)',
-                # 备用模式：匹配【用法用量】段落
-                r'【用法用量】([^【]+?)(?=【|$)',
-                r'用法用量[：:\s]*([^【]+?)(?=【|$)',
-                # 最后备用：匹配包含"用量"的完整段落
-                r'(用量\d+[-~～]\d+[克g][^【]*?)(?=【|$)',
-            ]
-            
-            for pattern in dosage_patterns:
-                match = re.search(pattern, cleaned_text)
-                if match:
-                    dosage_text = match.group(1).strip()
-                    
-                    # 清理HTML标签
-                    dosage_text = re.sub(r'<[^>]+>', '', dosage_text)
-                    # 清理多余的空白
-                    dosage_text = re.sub(r'\s+', ' ', dosage_text)
-                    
-                    # 移除明显的页面元素和链接
-                    dosage_text = re.sub(r'最近更新时间[：:].*', '', dosage_text)
-                    dosage_text = re.sub(r'更多相关文章.*', '', dosage_text)
-                    dosage_text = re.sub(r'中药常见偏方.*', '', dosage_text)
-                    
-                    # 去除开头和结尾的特殊字符（包括】）
-                    dosage_text = dosage_text.strip('。，；：】')
-                    
-                    # 验证内容质量：必须包含关键信息
-                    key_parts = ['用量', '克']
-                    has_key_info = any(part in dosage_text for part in key_parts)
-                    
-                    # 检查是否比现有dosage更完整
-                    current_dosage = herbal_data.get('dosage', '')
-                    is_more_complete = len(dosage_text) > len(current_dosage)
-                    
-                    if has_key_info and len(dosage_text) > 10 and len(dosage_text) < 500:
-                        # 如果新提取的内容更完整，则替换
-                        if is_more_complete:
-                            herbal_data['dosage'] = dosage_text
-                        break
-                    
-        except Exception as e:
-            logging.warning(f"提取用法用量信息失败: {e}")
-
-    def extract_common_pairings(self, herbal_data, cleaned_text):
-        """提取配伍药方信息（简化为字符串数组）"""
-        try:
-            # 查找配伍药方部分
-            pairing_patterns = [
-                r'【配伍药方】([^【]+)',
-                r'【相关药方】([^【]+)', 
-                r'配伍药方[：:\s]*([^【]+)',
-                r'相关药方[：:\s]*([^【]+)',
-            ]
-            
-            pairings = []
-            
-            for pattern in pairing_patterns:
-                match = re.search(pattern, cleaned_text)
-                if match:
-                    pairings_text = match.group(1).strip()
-                    
-                    # 提取具体的药方名称和组成
-                    # 匹配形如：①治xxx：药方名称、组成。的格式
-                    pairing_items = re.findall(r'[①②③④⑤⑥⑦⑧⑨⑩]\s*治([^：]+)[：:]\s*([^。①②③④⑤⑥⑦⑧⑨⑩]+)', pairings_text)
-                    
-                    for indication, formula in pairing_items:
-                        if len(indication.strip()) > 0 and len(formula.strip()) > 0:
-                            # 提取药方名称（通常在最后的括号中）
-                            name_match = re.search(r'\(([^)]+)\)$', formula.strip())
-                            formula_name = name_match.group(1) if name_match else ""
-                            
-                            # 清理配方内容，移除最后的来源信息
-                            clean_formula = re.sub(r'\([^)]*\)$', '', formula.strip()).strip()
-                            
-                            # 组合成字符串格式
-                            if formula_name:
-                                pairing_str = f"治{indication.strip()}：{clean_formula}（{formula_name}）"
-                            else:
-                                pairing_str = f"治{indication.strip()}：{clean_formula}"
-                            
-                            pairings.append(pairing_str)
-                    
-                    # 如果找到了配伍信息就跳出循环
-                    if pairings:
-                        break
-            
-            # 如果没有找到标准格式，尝试其他格式
-            if not pairings:
-                # 尝试匹配简单的药方列举
-                simple_patterns = [
-                    r'常用配伍[：:\s]*([^【]{1,200})',
-                    r'配伍[：:\s]*([^【]{1,200})',
-                ]
-                
-                for pattern in simple_patterns:
-                    match = re.search(pattern, cleaned_text)
-                    if match:
-                        pairing_text = match.group(1).strip()
-                        # 简单分割
-                        pairing_items = re.split(r'[。；]', pairing_text)
-                        for item in pairing_items:
-                            if item.strip() and len(item.strip()) > 5 and len(item.strip()) < 100:
-                                pairings.append(item.strip())
-                        break
-            
-            herbal_data['commonPairings'] = pairings
-            
-        except Exception as e:
-            logging.warning(f"提取配伍信息失败: {e}")
+        return category
     
-    def extract_cautions_info(self, herbal_data, page_text, soup):
-        """提取注意事项和禁忌 - 优化版：只保留核心禁忌信息"""
-        try:
-            cleaned_text = re.sub(r'\s+', ' ', page_text)
-            
-            # 优化的禁忌提取模式 - 只匹配到句号结束
-            contraindication_patterns = [
-                r'【使用禁忌】([^【。]*?)。',
-                r'【禁忌】([^【。]*?)。',
-                r'使用禁忌[：:\s]*([^【。]*?)。',
-                r'禁忌[：:\s]*([^【。]*?)。',
-                r'【注意事项】([^【。]*?)。',
-                r'注意事项[：:\s]*([^【。]*?)。',
-            ]
-            
-            for pattern in contraindication_patterns:
-                match = re.search(pattern, cleaned_text)
-                if match:
-                    contraindications_text = match.group(1).strip()
-                    
-                    # 清理HTML标签
-                    contraindications_text = re.sub(r'<[^>]+>', '', contraindications_text)
-                    # 清理多余的空白
-                    contraindications_text = re.sub(r'\s+', ' ', contraindications_text)
-                    # 去除开头和结尾的特殊字符
-                    contraindications_text = contraindications_text.strip('，；：】')
-                    
-                    if len(contraindications_text) > 2 and len(contraindications_text) < 100:
-                        herbal_data['contraindications'] = contraindications_text
-                        break
-                    
-        except Exception as e:
-            logging.warning(f"提取禁忌信息失败: {e}")
-    
-    def extract_description(self, herbal_data, page_text, soup):
-        """提取描述信息，整合药用部位、植物形态、产地分布、采收加工、药材性状等详细信息"""
-        try:
-            cleaned_text = re.sub(r'\s+', ' ', page_text)
-            description_parts = []
-            
-            # 定义要提取的字段模式
-            field_patterns = [
-                ('药用部位', [
-                    r'【药用部位】([^【]{1,300})',
-                    r'药用部位[：:\s]*([^【]{1,300})',
-                ]),
-                ('植物形态', [
-                    r'【植物形态】([^【]{1,500})',
-                    r'【形态特征】([^【]{1,500})',
-                    r'植物形态[：:\s]*([^【]{1,500})',
-                    r'形态特征[：:\s]*([^【]{1,500})',
-                ]),
-                ('产地分布', [
-                    r'【产地分布】([^【]{1,300})',
-                    r'【生境分布】([^【]{1,300})',
-                    r'产地分布[：:\s]*([^【]{1,300})',
-                    r'生境分布[：:\s]*([^【]{1,300})',
-                ]),
-                ('采收加工', [
-                    r'【采收加工】([^【]{1,300})',
-                    r'【采制】([^【]{1,300})',
-                    r'采收加工[：:\s]*([^【]{1,300})',
-                    r'采制[：:\s]*([^【]{1,300})',
-                ]),
-                ('药材性状', [
-                    r'【药材性状】([^【]{1,400})',
-                    r'【性状】([^【]{1,400})',
-                    r'药材性状[：:\s]*([^【]{1,400})',
-                    r'性状[：:\s]*([^【]{1,400})',
-                ])
-            ]
-            
-            # 提取每个字段的内容
-            for field_name, patterns in field_patterns:
-                field_content = None
-                
-                for pattern in patterns:
-                    match = re.search(pattern, cleaned_text)
-                    if match:
-                        content = match.group(1).strip()
-                        # 清理多余的空白和标点
-                        content = re.sub(r'\s+', ' ', content)
-                        content = content.strip('。，；：')
-                        
-                        # 过滤掉包含页面导航元素的内容
-                        if field_name == '药用部位':
-                            # 如果包含明显的导航或页面元素，跳过
-                            nav_keywords = ['分类', '共收录', '当前位置', '主页', '设为首页', '加入收藏', 'QQ空间', '朋友网']
-                            if any(keyword in content for keyword in nav_keywords):
-                                continue
-                            # 如果内容过长也可能包含无关信息
-                            if len(content) > 100:
-                                continue
-                        
-                        if len(content) > 10 and len(content) < 500:  # 合理的长度范围
-                            field_content = content
-                            break
-                
-                # 如果找到了内容，添加到描述中
-                if field_content:
-                    description_parts.append(f"{field_name}：{field_content}")
-            
-            # 如果没有找到任何特定字段，尝试获取基本信息
-            if not description_parts:
-                fallback_patterns = [
-                    r'【来源】([^【]{1,200})',
-                    r'【别名】([^【]{1,100})',
-                ]
-                
-                for pattern in fallback_patterns:
-                    match = re.search(pattern, cleaned_text)
-                    if match:
-                        content = match.group(1).strip()
-                        if len(content) > 5 and len(content) < 200:
-                            description_parts.append(content)
-                            break
-            
-            # 如果还是没有内容，使用页面标题
-            if not description_parts:
-                title = soup.find('title')
-                if title:
-                    title_text = title.get_text(strip=True)
-                    description_parts.append(title_text)
-            
-            # 组合所有部分，用换行符分割
-            if description_parts:
-                herbal_data['description'] = '\n'.join(description_parts)
-            else:
-                herbal_data['description'] = ""
-                    
-        except Exception as e:
-            logging.warning(f"提取描述信息失败: {e}")
-            herbal_data['description'] = ""
+    def _clean_html_tags(self, text):
+        """清理HTML标签和实体"""
+        if not text:
+            return ""
+        # 使用BeautifulSoup清理HTML标签
+        clean_text = BeautifulSoup(text, 'lxml').get_text()
+        # 替换多个空白字符为单个空格
+        clean_text = re.sub(r'\s+', ' ', clean_text)
+        return clean_text.strip()
     
     def extract_images(self, soup, page_url):
-        """提取药材图片 - 优化版：只提取真正的药材主图"""
+        """从详情页提取药材图片"""
         images = []
         try:
-            img_tags = soup.find_all('img')
+            # 首先尝试从页面中找到药材主图
+            content_area = soup.find('div', class_='gaishu')
+            if content_area:
+                main_img_tags = content_area.find_all('img')
+                for img in main_img_tags:
+                    src = img.get('src')
+                    if src and not src.endswith(('.gif', '.GIF')):
+                        img_url = urljoin(page_url, src)
+                        if img_url not in images:
+                            images.append(img_url)
             
-            for img in img_tags:
-                src = img.get('src')
-                if not src:
-                    continue
+            # 如果未在主内容区域找到图片，尝试查找整个页面的药材图片
+            if not images:
+                # 尝试查找特定区域内的图片
+                herb_img_divs = [
+                    soup.find('div', class_='gaishut'),
+                    soup.find('div', class_='text'),
+                    soup.find('div', class_='con_left2')
+                ]
                 
-                # 转换为绝对URL
-                full_url = urljoin(page_url, src)
-                
-                # 基本过滤：过滤掉明显不相关的图片
-                if not self.is_herb_image(src, img):
-                    continue
-                
-                # 精确过滤：只保留真正的药材主图
-                if self.is_main_herb_image(img, soup):
-                    images.append(full_url)
+                for div in herb_img_divs:
+                    if div:
+                        img_tags = div.find_all('img')
+                        for img in img_tags:
+                            src = img.get('src')
+                            if src and self.is_herb_image(src, img):
+                                img_url = urljoin(page_url, src)
+                                if img_url not in images:
+                                    images.append(img_url)
             
-            # 去重
-            images = list(set(images))
+            # 如果仍未找到图片，尝试查找整个页面中可能的药材图片
+            if not images:
+                # 获取页面所有图片
+                all_img_tags = soup.find_all('img')
+                
+                # 筛选可能的药材图片
+                for img in all_img_tags:
+                    src = img.get('src')
+                    if not src:
+                        continue
+                    
+                    # 转换为绝对 URL
+                    img_url = urljoin(page_url, src)
+                    
+                    # 过滤掉常见的非药材图片
+                    if self.is_herb_image(src, img):
+                        # 添加到图片列表
+                        if img_url not in images:
+                            images.append(img_url)
+            
+            # 查找特定的药材图片模式
+            # 在中药网站中，药材图片通常包含特定的路径模式
+            herb_image_patterns = [
+                '/uploads/allimg/',
+                '/yaocai/',
+                '/zhongyao/',
+                '/upload/image/',
+                '/herb/',
+                '/zyimg/'
+            ]
+            
+            potential_herb_images = []
+            for img_url in images:
+                for pattern in herb_image_patterns:
+                    if pattern in img_url.lower():
+                        potential_herb_images.append(img_url)
+                        break
+            
+            # 如果找到了特定模式的图片，优先使用这些图片
+            if potential_herb_images:
+                images = potential_herb_images
+                
+            # 移除重复的图片URL
+            images = list(dict.fromkeys(images))
             
         except Exception as e:
-            logging.warning(f"提取图片失败: {e}")
+            logging.error(f"提取图片失败: {e}")
         
         return images
     
     def is_herb_image(self, src, img_tag):
-        """判断是否为药材相关图片"""
-        # 过滤掉明显不相关的图片
-        exclude_keywords = ['logo', 'icon', 'button', 'banner', 'nav']
+        """判断图片是否为药材相关图片"""
+        # 忽略明显的非药材图片
+        ignored_patterns = [
+            'logo', 'icon', 'banner', 'button', 'ad', 'advertisement',
+            'nav', 'header', 'footer', 'sidebar', 'menu', 'share',
+            'like', 'comment', 'avatar', 'profile', 'user', 'bg', 'background'
+        ]
         
-        src_lower = src.lower()
-        for keyword in exclude_keywords:
-            if keyword in src_lower:
+        for pattern in ignored_patterns:
+            if pattern in src.lower():
                 return False
         
-        # 特殊处理：避免误判allimg中的ad
-        if 'ad' in src_lower and 'allimg' not in src_lower:
+        # 忽略常见的图标和装饰图片格式
+        if src.endswith(('.gif', '.GIF', 'dot.png', 'spacer.gif')):
             return False
         
-        # 检查图片尺寸属性
+        # 检查图片尺寸（如果有）
         width = img_tag.get('width')
         height = img_tag.get('height')
         
         if width and height:
             try:
-                w, h = int(width), int(height)
-                # 过滤掉太小的图片（可能是图标）
-                if w < 50 or h < 50:
+                w = int(width)
+                h = int(height)
+                # 忽略非常小的图片
+                if w < 100 or h < 100:
+                    return False
+                # 忽略过于细长的图片（可能是分隔线或装饰）
+                if w/h > 5 or h/w > 5:
                     return False
             except ValueError:
                 pass
         
+        # 检查alt和title属性，如果包含药材名称相关的词语，更可能是药材图片
+        alt_text = img_tag.get('alt', '').lower()
+        title_text = img_tag.get('title', '').lower()
+        
+        herb_keywords = ['药材', '中药', '植物', '药用', '功效', '形态', 'herb', 'medicinal']
+        for keyword in herb_keywords:
+            if keyword in alt_text or keyword in title_text:
+                return True
+        
+        # 检查父元素
+        parent = img_tag.parent
+        if parent:
+            parent_class = ' '.join(parent.get('class', []))
+            parent_id = parent.get('id', '')
+            parent_text = parent.get_text(strip=True)
+            
+            # 如果父元素是明显的非内容区域
+            if any(pattern in (parent_class + parent_id).lower() for pattern in ignored_patterns):
+                return False
+            
+            # 如果父元素文本包含植物、药材相关词汇，更可能是药材图片
+            herb_related_terms = ['植物', '药材', '形态', '性状', '图片', '药用', '中药', '种植', '采收']
+            if any(term in parent_text for term in herb_related_terms):
+                return True
+            
+            # 如果父元素有特定的class或id，可能是药材图片容器
+            herb_img_containers = ['herb-img', 'herb_img', 'herb-photo', 'herb_photo', 'drug-img', 'drug_img', 'yaocai']
+            if any(container in (parent_class + parent_id).lower() for container in herb_img_containers):
+                return True
+        
+        # 尝试通过URL模式判断
+        herb_image_patterns = ['/uploads/', '/images/', '/yaocai/', '/zhongyao/', '/upload/']
+        if any(pattern in src.lower() for pattern in herb_image_patterns):
+            return True
+        
+        # 默认可能接受大部分图片
         return True
     
-    def is_main_herb_image(self, img, soup):
-        """判断是否为药材主图（非相关推荐图片）"""
+    def crawl_all_pages(self, max_pages=None, max_herbs_per_page=None, start_page=1):
+        """爬取所有页面的药材数据
+        
+        参数:
+            max_pages: 最大爬取页数，None表示爬取所有页
+            max_herbs_per_page: 每页最大爬取药材数，None表示爬取所有
+            start_page: 起始页码，用于断点续传
+        """
+        logging.info("开始爬取所有药材数据...")
+        
         try:
-            # 检查1: Alt属性是否包含功效、作用等关键词
-            alt = img.get('alt', '').strip()
-            if alt:
-                # 如果alt包含功效、作用等关键词，可能是主图
-                main_keywords = ['功效', '作用', '的功效与作用']
-                if any(keyword in alt for keyword in main_keywords):
-                    return True
+            # 如果存在之前的数据，先加载
+            if os.path.exists('zhongyoo_herbal_data.json') and start_page > 1:
+                try:
+                    with open('zhongyoo_herbal_data.json', 'r', encoding='utf-8') as f:
+                        self.herbal_data = json.load(f)
+                    logging.info(f"已加载现有数据，共 {len(self.herbal_data)} 条记录")
+                    
+                    # 更新当前ID
+                    if self.herbal_data:
+                        self.current_id = max([item['id'] for item in self.herbal_data]) + 1
+                except Exception as e:
+                    logging.error(f"加载现有数据失败: {e}")
+            
+            # 获取第一页数据和总页数
+            _, total_pages = self.parse_name_list_page(1)
+            
+            # 如果指定了最大页数，使用较小值
+            if max_pages is not None:
+                total_pages = min(total_pages, max_pages)
+            
+            logging.info(f"共找到 {total_pages} 页药材数据")
+            
+            # 处理第一页数据（如果start_page为1）
+            if start_page == 1:
+                herbs_page1, _ = self.parse_name_list_page(1)
+                herbs_to_process = herbs_page1
                 
-                # 如果alt是其他药材名称，很可能是推荐图片
-                other_herb_keywords = ['苦瓜', '肾茶', '鸡冠花', '金果榄', '菊花', '白背叶根']
-                if any(keyword in alt for keyword in other_herb_keywords):
-                    return False
-            
-            # 检查2: 父元素结构
-            parent = img.parent
-            if parent:
-                # 如果父元素是链接且class包含title，很可能是推荐链接
-                if parent.name == 'a' and 'title' in parent.get('class', []):
-                    return False
+                if max_herbs_per_page is not None:
+                    herbs_to_process = herbs_to_process[:max_herbs_per_page]
                 
-                # 如果父元素是段落标签，可能是正文中的主图
-                if parent.name == 'p':
-                    return True
-            
-            # 检查3: 容器位置
-            container = img.find_parent('div')
-            if container:
-                container_classes = container.get('class', [])
+                for herb in herbs_to_process:
+                    herb_data = self.parse_herb_detail_page(herb)
+                    if herb_data:
+                        self.herbal_data.append(herb_data)
+                        logging.info(f"成功爬取药材: {herb['name']} ({len(self.herbal_data)}/{len(herbs_page1)})")
+                        # 每爬取5个药材保存一次数据
+                        if len(self.herbal_data) % 5 == 0:
+                            self.save_data()
                 
-                # 如果在主要文本区域，可能是主图
-                if 'text' in container_classes:
-                    return True
+                # 第一页完成后保存一次数据
+                self.save_data()
+                start_page = 2
+            
+            # 处理剩余页面
+            for page_num in range(start_page, total_pages + 1):
+                logging.info(f"开始爬取第 {page_num}/{total_pages} 页")
                 
-                # 如果在推荐区域，是推荐图片
-                if any(cls in container_classes for cls in ['box5_c', 'box8_c', 'marT10']):
-                    return False
+                herbs_page, _ = self.parse_name_list_page(page_num)
+                
+                if max_herbs_per_page is not None:
+                    herbs_page = herbs_page[:max_herbs_per_page]
+                
+                for i, herb in enumerate(herbs_page):
+                    herb_data = self.parse_herb_detail_page(herb)
+                    if herb_data:
+                        self.herbal_data.append(herb_data)
+                        logging.info(f"成功爬取药材: {herb['name']} ({i+1}/{len(herbs_page)})")
+                        # 每爬取5个药材保存一次数据
+                        if len(self.herbal_data) % 5 == 0:
+                            self.save_data()
+                
+                # 每页完成后保存一次数据
+                self.save_data()
+                
+                # 页面间延迟
+                time.sleep(random.uniform(self.page_interval[0], self.page_interval[1]))
+                
+                # 每爬取10页，提示一下当前进度
+                if page_num % 10 == 0:
+                    logging.info(f"已完成 {page_num}/{total_pages} 页的爬取，当前共有 {len(self.herbal_data)} 条数据")
             
-            # 检查4: 图片样式特征
-            style = img.get('style', '')
-            if style and ('width:' in style or 'height:' in style):
-                # 有明确尺寸设置的图片更可能是主图
-                return True
-            
-            # 检查5: 图片对齐方式
-            align = img.get('align', '')
-            if align in ['right', 'left']:
-                # 有对齐设置的图片更可能是正文中的主图
-                return True
-            
-            # 默认情况：如果无法确定，保守地认为是主图
-            return True
+            logging.info(f"所有页面爬取完成，共获取 {len(self.herbal_data)} 个药材数据")
             
         except Exception as e:
-            logging.warning(f"判断主图失败: {e}")
-            return True
-    
-    def crawl_all_categories(self, max_categories=None, max_herbs_per_category=None):
-        """爬取所有分类的药材数据"""
-        logging.info("开始爬取所有分类的药材数据...")
-        
-        # 首先获取所有分类
-        categories = self.parse_category_page()
-        
-        if not categories:
-            logging.error("未能获取到任何分类信息")
-            return
-        
-        # 限制爬取的分类数量
-        if max_categories:
-            categories = categories[:max_categories]
-        
-        for i, category in enumerate(categories, 1):
-            logging.info(f"处理分类 {i}/{len(categories)}: {category['name']}")
-            
-            # 获取该分类下的药材列表
-            herb_items = self.parse_category_list_page(category)
-            
-            if not herb_items:
-                logging.warning(f"分类 '{category['name']}' 中没有找到药材")
-                continue
-            
-            # 限制每个分类爬取的药材数量
-            if max_herbs_per_category:
-                herb_items = herb_items[:max_herbs_per_category]
-            
-            # 爬取每个药材的详细信息
-            for j, herb_item in enumerate(herb_items, 1):
-                logging.info(f"处理药材 {j}/{len(herb_items)}: {herb_item['name']}")
-                
-                herb_data = self.parse_herb_detail_page(herb_item)
-                if herb_data:
-                    self.herbal_data.append(herb_data)
-                    logging.info(f"成功爬取药材 '{herb_item['name']}' 的信息")
-                
-                # 每爬取5个药材后保存一次数据
-                if len(self.herbal_data) % 5 == 0:
-                    self.save_data()
-            
-            # 每个分类之间增加延时
-            time.sleep(2)
-        
-        # 最终保存所有数据
-        self.save_data()
-        logging.info(f"爬取完成！总共获取了 {len(self.herbal_data)} 个药材的信息")
+            logging.error(f"爬取过程中出现错误: {e}")
+        finally:
+            # 保存已获取的数据
+            self.save_data()
     
     def save_data(self):
-        """保存数据到JSON文件"""
-        if not self.herbal_data:
-            logging.warning("没有数据需要保存")
-            return
-        
-        filename = 'zhongyoo_herbal_data.json'
+        """保存爬取的数据到JSON文件"""
         try:
-            with open(filename, 'w', encoding='utf-8') as f:
+            # 主JSON文件，确保中文字符正确显示
+            with open('zhongyoo_herbal_data.json', 'w', encoding='utf-8') as f:
                 json.dump(self.herbal_data, f, ensure_ascii=False, indent=2)
-            logging.info(f"数据已保存到 {filename}，共 {len(self.herbal_data)} 条记录")
+            logging.info(f"数据已保存到 zhongyoo_herbal_data.json, 共 {len(self.herbal_data)} 条记录")
+            
+            # 额外保存一个用于调试的副本
+            with open('zhongyoo_herbal_data_debug.json', 'w', encoding='utf-8') as f:
+                # 使用ASCII编码可以在控制台查看
+                json.dump(self.herbal_data, f, ensure_ascii=True, indent=2)
         except Exception as e:
             logging.error(f"保存数据失败: {e}")
 
 def main():
     """主函数"""
     crawler = ZhongYooHerbalCrawler()
-    
-    print("=== 中医药网数据爬取工具 ===")
-    print("1. 查看所有分类")
-    print("2. 爬取指定数量的分类数据")
-    print("3. 爬取所有分类数据")
-    
-    choice = input("请选择操作 (1-3): ").strip()
-    
-    if choice == "1":
-        # 仅查看分类
-        categories = crawler.parse_category_page()
-        print(f"\n找到 {len(categories)} 个分类:")
-        for i, category in enumerate(categories, 1):
-            print(f"{i}. {category['name']} - {category['url']}")
-    
-    elif choice == "2":
-        # 爬取指定数量
-        max_categories = input("请输入要爬取的分类数量（默认3个）: ").strip()
-        max_herbs = input("请输入每个分类爬取的药材数量（默认5个）: ").strip()
+    try:
+        # 获取命令行参数
+        parser = argparse.ArgumentParser(description='中药材爬虫')
+        parser.add_argument('--max-pages', type=int, help='最大爬取页数，默认全部爬取', default=None)
+        parser.add_argument('--max-herbs', type=int, help='每页最大爬取药材数，默认全部爬取', default=None)
+        parser.add_argument('--start-page', type=int, help='起始页码，用于断点续传', default=1)
+        parser.add_argument('--interval', type=int, help='页面间隔基准秒数，实际为随机(n,n+2)秒', default=4)
+        args = parser.parse_args()
         
-        try:
-            max_categories = int(max_categories) if max_categories else 3
-            max_herbs = int(max_herbs) if max_herbs else 5
-        except ValueError:
-            max_categories, max_herbs = 3, 5
+        # 设置爬取间隔
+        if args.interval:
+            crawler.page_interval = (args.interval, args.interval + 2)
+            crawler.item_interval = (args.interval // 2, args.interval // 2 + 1)
+            logging.info(f"已设置页面间隔 {crawler.page_interval} 秒，药材间隔 {crawler.item_interval} 秒")
         
-        crawler.crawl_all_categories(max_categories=max_categories, 
-                                   max_herbs_per_category=max_herbs)
+        # 爬取数据
+        crawler.crawl_all_pages(args.max_pages, args.max_herbs, args.start_page)
+        
+    except KeyboardInterrupt:
+        print("\n用户中断爬取，已保存当前进度")
+    except Exception as e:
+        logging.error(f"爬取过程中出现错误: {e}")
+    finally:
+        # 保存已获取的数据
+        crawler.save_data()
+
+def test_parser():
+    """测试解析器"""
+    crawler = ZhongYooHerbalCrawler()
     
-    elif choice == "3":
-        # 爬取所有数据
-        confirm = input("这将爬取所有分类的所有药材数据，可能需要很长时间。确认继续？(y/N): ").strip().lower()
-        if confirm == 'y':
-            crawler.crawl_all_categories()
-        else:
-            print("操作已取消")
+    # 测试第一页
+    herbs, total_pages = crawler.parse_name_list_page(1)
     
-    else:
-        print("无效的选择")
+    print(f"找到 {len(herbs)} 个药材，共 {total_pages} 页")
+    for i, herb in enumerate(herbs[:5]):  # 只打印前5个
+        print(f"{i+1}. {herb['name']} - {herb['url']}")
+    
+    if len(herbs) > 0:
+        print("\n测试解析第一个药材详情页...")
+        herb_data = crawler.parse_herb_detail_page(herbs[0])
+        if herb_data:
+            print(f"药材名称: {herb_data['name']}")
+            print(f"拼音: {herb_data['pinyin']}")
+            print(f"分类: {herb_data['category']}")
+            print(f"味道归经: {herb_data['taste']}")
+            print(f"归经: {herb_data['meridians']}")
+            print(f"图片数量: {len(herb_data['images'])}")
+    
+    # 测试第二页
+    print("\n测试第二页...")
+    herbs_page2, _ = crawler.parse_name_list_page(2)
+    print(f"第二页找到 {len(herbs_page2)} 个药材")
+    for i, herb in enumerate(herbs_page2[:5]):  # 只打印前5个
+        print(f"{i+1}. {herb['name']} - {herb['url']}")
 
 if __name__ == "__main__":
-    main() 
+    # 判断是否为测试模式
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_parser()
+    else:
+        main() 
